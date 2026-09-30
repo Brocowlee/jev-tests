@@ -3,13 +3,13 @@
 Backends:
   jev         OpenRouter Decisions API, one "noul" question per article;
               % = noul probability * 100.            needs OPENROUTER_API_KEY
+  nimble      same noul question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434)
   openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
-  ollama      same prompt via OLLAMA_HOST (default :11434)
 
 Usage:
   python classify.py --backend jev        --model typesafe/jev-1.13   --label jev
   python classify.py --backend openrouter --model qwen/qwen3.8-27b    --label qwen3.8_27b
-  python classify.py --backend ollama     --model <model>             --label nimble
+  python classify.py --backend nimble     --model nimble              --label nimble
   python classify.py --merge   # build the comparison CSV from results/*.csv
 """
 import argparse
@@ -112,52 +112,48 @@ def call_openrouter(prompt, model):
     return data['choices'][0]['message']['content']
 
 
-def jev_noul(article, model):
-    key = os.environ.get('OPENROUTER_API_KEY')
-    if not key:
-        sys.exit('OPENROUTER_API_KEY is not set')
+def decision_endpoint(backend):
+    """URL + headers for the Jev-style decisions API (state + typed questions)."""
+    if backend == 'jev':
+        key = os.environ.get('OPENROUTER_API_KEY')
+        if not key:
+            sys.exit('OPENROUTER_API_KEY is not set')
+        return ('https://openrouter.ai/api/alpha/decisions',
+                {'Authorization': f'Bearer {key}', 'X-Title': 'jev-tests'})
+    host = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
+    if not host.startswith('http'):
+        host = 'http://' + host
+    return f'{host}/v1/systemone', {}
+
+
+def ask_noul(url, headers, article, model):
     resp = requests.post(
-        'https://openrouter.ai/api/alpha/decisions',
-        headers={'Authorization': f'Bearer {key}', 'X-Title': 'jev-tests'},
+        url, headers=headers,
         json={'model': model,
               'state': {'title': article['title'], 'body': article['body_text']},
               'questions': {'relevant': {'type': 'noul', 'instructions': QUESTION}}},
-        timeout=60)
+        timeout=300)
     resp.raise_for_status()
     data = resp.json()
     return data['answers']['relevant']['noul'], data
 
 
-def classify_jev(model, articles):
+def classify_noul(backend, model, articles):
+    url, headers = decision_endpoint(backend)
     results, cost = {}, 0.0
     for i, a in enumerate(articles, 1):
         try:
-            noul, data = jev_noul(a, model)
+            noul, data = ask_noul(url, headers, a, model)
         except (KeyError, requests.RequestException) as exc:
             print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
             continue
-        cost += data.get('usage', {}).get('cost', 0) or 0
+        cost += (data.get('usage') or {}).get('cost', 0) or 0
         results[a['article_id']] = {'raw': noul, 'pct': round(noul * 100, 1), 'reason': '',
-                                    'method': f"jev/{data.get('model', model)}"}
+                                    'method': f"{backend}/{data.get('model', model)}"}
         print(f'  [{i}/{len(articles)}] {noul:.2f}  {a["title"][:70]}')
-    print(f'  total cost: ${cost:.6f}')
+    if cost:
+        print(f'  total cost: ${cost:.6f}')
     return results
-
-
-def call_ollama(prompt, model):
-    host = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
-    if not host.startswith('http'):
-        host = 'http://' + host
-    resp = requests.post(
-        f'{host}/api/chat',
-        json={'model': model,
-              'messages': [{'role': 'user', 'content': prompt}],
-              'format': SCHEMA,
-              'stream': False,
-              'options': {'temperature': 0, 'num_ctx': 32768}},
-        timeout=1800)
-    resp.raise_for_status()
-    return resp.json()['message']['content']
 
 
 def parse_verdicts(text):
@@ -169,13 +165,12 @@ def parse_verdicts(text):
 
 
 def classify(backend, model, articles, retries=2):
-    call = call_openrouter if backend == 'openrouter' else call_ollama
     verdicts, todo = {}, articles
     for attempt in range(retries + 1):
         print(f'  attempt {attempt + 1}: {len(todo)} articles')
         t0 = time.time()
         try:
-            got = parse_verdicts(call(build_prompt(todo), model))
+            got = parse_verdicts(call_openrouter(build_prompt(todo), model))
         except (json.JSONDecodeError, ValueError, RuntimeError, requests.RequestException) as exc:
             print(f'  failed: {exc}')
             got = {}
@@ -197,8 +192,8 @@ def to_pct(score):
 def run(args):
     articles = load_articles()
     print(f'{args.label}: {args.backend}/{args.model}')
-    if args.backend == 'jev':
-        results = classify_jev(args.model, articles)
+    if args.backend in ('jev', 'nimble'):
+        results = classify_noul(args.backend, args.model, articles)
     else:
         results = {k: {'raw': v['score'], 'pct': to_pct(v['score']),
                        'reason': v.get('justification', ''),
@@ -251,7 +246,7 @@ def merge():
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--backend', choices=['jev', 'openrouter', 'ollama'])
+    p.add_argument('--backend', choices=['jev', 'nimble', 'openrouter'])
     p.add_argument('--model')
     p.add_argument('--label')
     p.add_argument('--merge', action='store_true')
