@@ -1,12 +1,13 @@
-"""Score each article of the CSV for relevance to a research question (0-3 scale),
-then store the result as a percentage (score / 3 * 100).
+"""Score each article of the CSV for relevance to a research question, as a percentage.
 
 Backends:
-  openrouter  needs OPENROUTER_API_KEY           e.g. --model typesafe/jev-router
-  ollama      needs OLLAMA_HOST (default :11434)  e.g. --model <nimble model name>
+  jev         OpenRouter Decisions API, one "noul" question per article;
+              % = noul probability * 100.            needs OPENROUTER_API_KEY
+  openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
+  ollama      same prompt via OLLAMA_HOST (default :11434)
 
 Usage:
-  python classify.py --backend openrouter --model typesafe/jev-router --label jev
+  python classify.py --backend jev        --model typesafe/jev-1.13   --label jev
   python classify.py --backend openrouter --model qwen/qwen3.8-27b    --label qwen3.8_27b
   python classify.py --backend ollama     --model <model>             --label nimble
   python classify.py --merge   # build the comparison CSV from results/*.csv
@@ -111,6 +112,38 @@ def call_openrouter(prompt, model):
     return data['choices'][0]['message']['content']
 
 
+def jev_noul(article, model):
+    key = os.environ.get('OPENROUTER_API_KEY')
+    if not key:
+        sys.exit('OPENROUTER_API_KEY is not set')
+    resp = requests.post(
+        'https://openrouter.ai/api/alpha/decisions',
+        headers={'Authorization': f'Bearer {key}', 'X-Title': 'jev-tests'},
+        json={'model': model,
+              'state': {'title': article['title'], 'body': article['body_text']},
+              'questions': {'relevant': {'type': 'noul', 'instructions': QUESTION}}},
+        timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data['answers']['relevant']['noul'], data
+
+
+def classify_jev(model, articles):
+    results, cost = {}, 0.0
+    for i, a in enumerate(articles, 1):
+        try:
+            noul, data = jev_noul(a, model)
+        except (KeyError, requests.RequestException) as exc:
+            print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
+            continue
+        cost += data.get('usage', {}).get('cost', 0) or 0
+        results[a['article_id']] = {'raw': noul, 'pct': round(noul * 100, 1), 'reason': '',
+                                    'method': f"jev/{data.get('model', model)}"}
+        print(f'  [{i}/{len(articles)}] {noul:.2f}  {a["title"][:70]}')
+    print(f'  total cost: ${cost:.6f}')
+    return results
+
+
 def call_ollama(prompt, model):
     host = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
     if not host.startswith('http'):
@@ -164,19 +197,22 @@ def to_pct(score):
 def run(args):
     articles = load_articles()
     print(f'{args.label}: {args.backend}/{args.model}')
-    verdicts = classify(args.backend, args.model, articles)
+    if args.backend == 'jev':
+        results = classify_jev(args.model, articles)
+    else:
+        results = {k: {'raw': v['score'], 'pct': to_pct(v['score']),
+                       'reason': v.get('justification', ''),
+                       'method': f'{args.backend}/{args.model}'}
+                   for k, v in classify(args.backend, args.model, articles).items()}
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out = os.path.join(RESULTS_DIR, f'{args.label}.csv')
     with open(out, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['article_id', 'score_raw', 'score_pct', 'reason', 'method'])
         for a in articles:
-            v = verdicts.get(a['article_id'])
-            w.writerow([a['article_id'],
-                        v['score'] if v else '',
-                        to_pct(v['score']) if v else '',
-                        v.get('justification', '') if v else '',
-                        f'{args.backend}/{args.model}'])
+            r = results.get(a['article_id'], {})
+            w.writerow([a['article_id'], r.get('raw', ''), r.get('pct', ''),
+                        r.get('reason', ''), r.get('method', '')])
     print(f'  wrote {out}')
 
 
@@ -209,15 +245,13 @@ def merge():
         pairs = [(to_pct(a['score']), float(res[a['article_id']]['score_pct']))
                  for a in articles if res.get(a['article_id'], {}).get('score_pct')]
         if pairs:
-            exact = sum(h == m for h, m in pairs)
             mae = sum(abs(h - m) for h, m in pairs) / len(pairs)
-            print(f'  {label}: {len(pairs)} scored, exact match with haiku {exact}/{len(pairs)}, '
-                  f'mean abs diff {mae:.1f} pts')
+            print(f'  {label}: {len(pairs)} scored, mean abs diff vs haiku {mae:.1f} pts')
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--backend', choices=['openrouter', 'ollama'])
+    p.add_argument('--backend', choices=['jev', 'openrouter', 'ollama'])
     p.add_argument('--model')
     p.add_argument('--label')
     p.add_argument('--merge', action='store_true')
