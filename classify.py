@@ -1,9 +1,10 @@
 """Score each article of the CSV for relevance to a research question, as a percentage.
 
 Backends:
-  jev         OpenRouter Decisions API, one "noul" question per article;
-              % = noul probability * 100.            needs OPENROUTER_API_KEY
-  nimble      same noul question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434)
+  jev         OpenRouter Decisions API, one "score" question per article on the
+              0-3 scale;  % = score / 3 * 100.       needs OPENROUTER_API_KEY
+  nimble      "noul" question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434);
+              % = noul probability * 100
   openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
 
 Usage:
@@ -56,6 +57,15 @@ RÈGLES IMPÉRATIVES :
 === RÉPONSE ATTENDUE ===
 Réponds UNIQUEMENT par un objet JSON valide conforme à ce schéma :
 {schema}"""
+
+# Same 0-3 scale as the prompt, as ordered levels for the decisions API "score" type.
+SCORE_LEVELS = [
+    "HORS SUJET : l'article ne traite pas de ce thème, même indirectement.",
+    "MENTION : le thème n'est évoqué qu'en passant — une phrase, une citation isolée, une allusion.",
+    "SUBSTANTIEL : le thème est traité de façon développée (plusieurs paragraphes, une analyse, "
+    "des faits précis) sans être le sujet principal de l'article.",
+    "CENTRAL : la question de recherche est le sujet principal de l'article.",
+]
 
 SCHEMA = {
     "type": "object",
@@ -126,31 +136,36 @@ def decision_endpoint(backend):
     return f'{host}/v1/systemone', {}
 
 
-def ask_noul(url, headers, article, model):
+def ask_decision(url, headers, article, model, qtype):
+    question = {'type': qtype, 'instructions': QUESTION}
+    if qtype == 'score':
+        question['criteria'] = SCORE_LEVELS
     resp = requests.post(
         url, headers=headers,
         json={'model': model,
               'state': {'title': article['title'], 'body': article['body_text']},
-              'questions': {'relevant': {'type': 'noul', 'instructions': QUESTION}}},
+              'questions': {'relevant': question}},
         timeout=300)
-    resp.raise_for_status()
+    if not resp.ok:  # the body says why (e.g. input too long), raise_for_status hides it
+        raise requests.HTTPError(f'{resp.status_code}: {resp.text[:500]}', response=resp)
     data = resp.json()
-    return data['answers']['relevant']['noul'], data
+    return data['answers']['relevant'][qtype], data
 
 
-def classify_noul(backend, model, articles):
+def classify_decision(backend, model, articles):
     url, headers = decision_endpoint(backend)
+    qtype, top = ('score', len(SCORE_LEVELS) - 1) if backend == 'jev' else ('noul', 1)
     results, cost = {}, 0.0
     for i, a in enumerate(articles, 1):
         try:
-            noul, data = ask_noul(url, headers, a, model)
+            value, data = ask_decision(url, headers, a, model, qtype)
         except (KeyError, requests.RequestException) as exc:
             print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
             continue
         cost += (data.get('usage') or {}).get('cost', 0) or 0
-        results[a['article_id']] = {'raw': noul, 'pct': round(noul * 100, 1), 'reason': '',
-                                    'method': f"{backend}/{data.get('model', model)}"}
-        print(f'  [{i}/{len(articles)}] {noul:.2f}  {a["title"][:70]}')
+        results[a['article_id']] = {'raw': round(value, 2), 'pct': round(value / top * 100, 1),
+                                    'reason': '', 'method': f"{backend}/{data.get('model', model)}"}
+        print(f'  [{i}/{len(articles)}] {value:.2f}  {a["title"][:70]}')
     if cost:
         print(f'  total cost: ${cost:.6f}')
     return results
@@ -193,7 +208,7 @@ def run(args):
     articles = load_articles()
     print(f'{args.label}: {args.backend}/{args.model}')
     if args.backend in ('jev', 'nimble'):
-        results = classify_noul(args.backend, args.model, articles)
+        results = classify_decision(args.backend, args.model, articles)
     else:
         results = {k: {'raw': v['score'], 'pct': to_pct(v['score']),
                        'reason': v.get('justification', ''),
