@@ -4,12 +4,15 @@ Backends:
   jev         OpenRouter Decisions API, one "noul" question per article; the
               probability is bucketed into 0-3 by quarters;
               % = score / 3 * 100.                   needs OPENROUTER_API_KEY
+  jev-score   same API, one "score" question whose 4 levels are the prompt's 0-3
+              definitions; weighted position rounded to the nearest level.
   nimble      same noul question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434);
               % = noul probability * 100
   openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
 
 Usage:
   python classify.py --backend jev        --model typesafe/jev-1.13   --label jev
+  python classify.py --backend jev-score  --model typesafe/jev-1.13   --label jev_score
   python classify.py --backend openrouter --model qwen/qwen3.8-27b    --label qwen3.8_27b
   python classify.py --backend nimble     --model nimble              --label nimble
   python classify.py --merge   # build the comparison CSV from results/*.csv
@@ -33,16 +36,24 @@ MERGED_CSV = os.path.join(HERE, 'topic1_last7d_compare.csv')
 QUESTION = ("Cet article traite-t-il du rôle de Taïwan dans les chaînes "
             "d'approvisionnement mondiales des technologies émergentes ?")
 
+# The 0-3 scale, index = score. Shared by the chat prompt and the jev-score criteria.
+LEVELS = [
+    "HORS SUJET : l'article ne traite pas de ce thème, même indirectement.",
+    "MENTION : le thème n'est évoqué qu'en passant — une phrase, une citation isolée, une allusion.",
+    "SUBSTANTIEL : le thème est traité de façon développée (plusieurs paragraphes, une analyse, "
+    "des faits précis) sans être le sujet principal de l'article.",
+    "CENTRAL : la question de recherche est le sujet principal de l'article. "
+    "Retirer ce thème de l'article le viderait de sa substance.",
+]
+RUBRIC = '\n'.join(f'- {i} = {LEVELS[i]}' for i in reversed(range(len(LEVELS))))
+
 PROMPT = """Tu es analyste de veille documentaire. Tu dois évaluer la PERTINENCE de chacun des articles ci-dessous par rapport à une question de recherche précise.
 
 QUESTION DE RECHERCHE :
 {question}
 
 BARÈME DE PERTINENCE (note de 0 à 3) :
-- 3 = CENTRAL : la question de recherche est le sujet principal de l'article. Retirer ce thème de l'article le viderait de sa substance.
-- 2 = SUBSTANTIEL : le thème est traité de façon développée (plusieurs paragraphes, une analyse, des faits précis) sans être le sujet principal de l'article.
-- 1 = MENTION : le thème n'est évoqué qu'en passant — une phrase, une citation isolée, une allusion.
-- 0 = HORS SUJET : l'article ne traite pas de ce thème, même indirectement.
+{rubric}
 
 RÈGLES IMPÉRATIVES :
 1. Tu dois rendre un verdict pour CHACUN des {n_articles} articles fournis, sans aucune exception. Un article difficile à juger reçoit une note, jamais un silence.
@@ -89,7 +100,7 @@ def build_prompt(articles):
         f"--- ARTICLE ---\nid: {a['article_id']}\ntitre: {a['title']}\n"
         f"date: {a['date']}\n\n{a['body_text']}"
         for a in articles)
-    return PROMPT.format(question=QUESTION, n_articles=len(articles), corpus=corpus,
+    return PROMPT.format(question=QUESTION, rubric=RUBRIC, n_articles=len(articles), corpus=corpus,
                          schema=json.dumps(SCHEMA, ensure_ascii=False, indent=2))
 
 
@@ -116,7 +127,7 @@ def call_openrouter(prompt, model):
 
 def decision_endpoint(backend):
     """URL + headers for the Jev-style decisions API (state + typed questions)."""
-    if backend == 'jev':
+    if backend in ('jev', 'jev-score'):
         key = os.environ.get('OPENROUTER_API_KEY')
         if not key:
             sys.exit('OPENROUTER_API_KEY is not set')
@@ -179,6 +190,40 @@ def parse_verdicts(text):
     return {v['id'].strip(): v for v in data.get('verdicts', [])}
 
 
+def ask_score(url, headers, article, model):
+    resp = requests.post(
+        url, headers=headers,
+        json={'model': model,
+              'state': {'title': article['title'], 'body': article['body_text']},
+              'questions': {'relevant': {'type': 'score', 'instructions': QUESTION,
+                                         'criteria': LEVELS}}},
+        timeout=300)
+    if not resp.ok:
+        raise requests.HTTPError(f'{resp.status_code}: {resp.text[:500]}', response=resp)
+    data = resp.json()
+    return data['answers']['relevant']['score'], data
+
+
+def classify_score(backend, model, articles):
+    url, headers = decision_endpoint(backend)
+    results, cost = {}, 0.0
+    for i, a in enumerate(articles, 1):
+        try:
+            value, data = ask_score(url, headers, a, model)
+        except (KeyError, requests.RequestException) as exc:
+            print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
+            continue
+        cost += (data.get('usage') or {}).get('cost', 0) or 0
+        score = round(value)  # weighted position (e.g. 1.99) -> nearest level
+        results[a['article_id']] = {'raw': score, 'pct': to_pct(score),
+                                    'reason': f'score={value:.2f}',
+                                    'method': f"{backend}/{data.get('model', model)}"}
+        print(f'  [{i}/{len(articles)}] {score} ({value:.2f})  {a["title"][:70]}')
+    if cost:
+        print(f'  total cost: ${cost:.6f}')
+    return results
+
+
 def classify(backend, model, articles, retries=2):
     verdicts, todo = {}, articles
     for attempt in range(retries + 1):
@@ -209,6 +254,8 @@ def run(args):
     print(f'{args.label}: {args.backend}/{args.model}')
     if args.backend in ('jev', 'nimble'):
         results = classify_noul(args.backend, args.model, articles)
+    elif args.backend == 'jev-score':
+        results = classify_score(args.backend, args.model, articles)
     else:
         results = {k: {'raw': v['score'], 'pct': to_pct(v['score']),
                        'reason': v.get('justification', ''),
@@ -261,7 +308,7 @@ def merge():
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--backend', choices=['jev', 'nimble', 'openrouter'])
+    p.add_argument('--backend', choices=['jev', 'jev-score', 'nimble', 'openrouter'])
     p.add_argument('--model')
     p.add_argument('--label')
     p.add_argument('--merge', action='store_true')
