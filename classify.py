@@ -2,7 +2,7 @@
 
 Backends:
   jev         OpenRouter Decisions API, one "score" question per article on the
-              0-3 scale;  % = score / 3 * 100.       needs OPENROUTER_API_KEY
+              0-3 scale, most likely level kept;  % = score / 3 * 100.       needs OPENROUTER_API_KEY
   nimble      "noul" question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434);
               % = noul probability * 100
   openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
@@ -149,7 +149,11 @@ def ask_decision(url, headers, article, model, qtype):
     if not resp.ok:  # the body says why (e.g. input too long), raise_for_status hides it
         raise requests.HTTPError(f'{resp.status_code}: {resp.text[:500]}', response=resp)
     data = resp.json()
-    return data['answers']['relevant'][qtype], data
+    answer = data['answers']['relevant']
+    if qtype == 'score':  # keep the most likely level, not the weighted average
+        probs = answer['probabilities']
+        return int(max(probs, key=probs.get)), data
+    return answer[qtype], data
 
 
 def classify_decision(backend, model, articles):
@@ -163,9 +167,9 @@ def classify_decision(backend, model, articles):
             print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
             continue
         cost += (data.get('usage') or {}).get('cost', 0) or 0
-        results[a['article_id']] = {'raw': round(value, 2), 'pct': round(value / top * 100, 1),
+        results[a['article_id']] = {'raw': value, 'pct': round(value / top * 100, 1),
                                     'reason': '', 'method': f"{backend}/{data.get('model', model)}"}
-        print(f'  [{i}/{len(articles)}] {value:.2f}  {a["title"][:70]}')
+        print(f'  [{i}/{len(articles)}] {value:g}  {a["title"][:70]}')
     if cost:
         print(f'  total cost: ${cost:.6f}')
     return results
