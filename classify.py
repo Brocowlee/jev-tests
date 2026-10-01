@@ -1,9 +1,10 @@
 """Score each article of the CSV for relevance to a research question, as a percentage.
 
 Backends:
-  jev         OpenRouter Decisions API, one "score" question per article on the
-              0-3 scale, most likely level kept;  % = score / 3 * 100.       needs OPENROUTER_API_KEY
-  nimble      "noul" question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434);
+  jev         OpenRouter Decisions API, one "noul" question per article; the
+              probability is bucketed into 0-3 by quarters;
+              % = score / 3 * 100.                   needs OPENROUTER_API_KEY
+  nimble      same noul question via Ollama's /v1/systemone (OLLAMA_HOST, default :11434);
               % = noul probability * 100
   openrouter  chat completions with the 0-3 prompt;  % = score / 3 * 100
 
@@ -57,15 +58,6 @@ RÈGLES IMPÉRATIVES :
 === RÉPONSE ATTENDUE ===
 Réponds UNIQUEMENT par un objet JSON valide conforme à ce schéma :
 {schema}"""
-
-# Same 0-3 scale as the prompt, as ordered levels for the decisions API "score" type.
-SCORE_LEVELS = [
-    "HORS SUJET : l'article ne traite pas de ce thème, même indirectement.",
-    "MENTION : le thème n'est évoqué qu'en passant — une phrase, une citation isolée, une allusion.",
-    "SUBSTANTIEL : le thème est traité de façon développée (plusieurs paragraphes, une analyse, "
-    "des faits précis) sans être le sujet principal de l'article.",
-    "CENTRAL : la question de recherche est le sujet principal de l'article.",
-]
 
 SCHEMA = {
     "type": "object",
@@ -136,40 +128,44 @@ def decision_endpoint(backend):
     return f'{host}/v1/systemone', {}
 
 
-def ask_decision(url, headers, article, model, qtype):
-    question = {'type': qtype, 'instructions': QUESTION}
-    if qtype == 'score':
-        question['criteria'] = SCORE_LEVELS
+def ask_noul(url, headers, article, model):
     resp = requests.post(
         url, headers=headers,
         json={'model': model,
               'state': {'title': article['title'], 'body': article['body_text']},
-              'questions': {'relevant': question}},
+              'questions': {'relevant': {'type': 'noul', 'instructions': QUESTION}}},
         timeout=300)
     if not resp.ok:  # the body says why (e.g. input too long), raise_for_status hides it
         raise requests.HTTPError(f'{resp.status_code}: {resp.text[:500]}', response=resp)
     data = resp.json()
-    answer = data['answers']['relevant']
-    if qtype == 'score':  # keep the most likely level, not the weighted average
-        probs = answer['probabilities']
-        return int(max(probs, key=probs.get)), data
-    return answer[qtype], data
+    return data['answers']['relevant']['noul'], data
 
 
-def classify_decision(backend, model, articles):
+def noul_to_score(noul):
+    """Bucket a noul probability into the 0-3 scale: [0, .25) -> 0, ..., [.75, 1] -> 3."""
+    return min(int(noul * 4), 3)
+
+
+def classify_noul(backend, model, articles):
     url, headers = decision_endpoint(backend)
-    qtype, top = ('score', len(SCORE_LEVELS) - 1) if backend == 'jev' else ('noul', 1)
     results, cost = {}, 0.0
     for i, a in enumerate(articles, 1):
         try:
-            value, data = ask_decision(url, headers, a, model, qtype)
+            noul, data = ask_noul(url, headers, a, model)
         except (KeyError, requests.RequestException) as exc:
             print(f'  [{i}/{len(articles)}] {a["article_id"]}: failed: {exc}')
             continue
         cost += (data.get('usage') or {}).get('cost', 0) or 0
-        results[a['article_id']] = {'raw': value, 'pct': round(value / top * 100, 1),
-                                    'reason': '', 'method': f"{backend}/{data.get('model', model)}"}
-        print(f'  [{i}/{len(articles)}] {value:g}  {a["title"][:70]}')
+        method = f"{backend}/{data.get('model', model)}"
+        if backend == 'jev':
+            score = noul_to_score(noul)
+            results[a['article_id']] = {'raw': score, 'pct': to_pct(score),
+                                        'reason': f'noul={noul:.2f}', 'method': method}
+            print(f'  [{i}/{len(articles)}] {score} ({noul:.2f})  {a["title"][:70]}')
+        else:
+            results[a['article_id']] = {'raw': noul, 'pct': round(noul * 100, 1), 'reason': '',
+                                        'method': method}
+            print(f'  [{i}/{len(articles)}] {noul:.2f}  {a["title"][:70]}')
     if cost:
         print(f'  total cost: ${cost:.6f}')
     return results
@@ -212,7 +208,7 @@ def run(args):
     articles = load_articles()
     print(f'{args.label}: {args.backend}/{args.model}')
     if args.backend in ('jev', 'nimble'):
-        results = classify_decision(args.backend, args.model, articles)
+        results = classify_noul(args.backend, args.model, articles)
     else:
         results = {k: {'raw': v['score'], 'pct': to_pct(v['score']),
                        'reason': v.get('justification', ''),
