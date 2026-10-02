@@ -14,6 +14,7 @@ Usage:
   python classify.py --backend jev        --model typesafe/jev-1.13   --label jev
   python classify.py --backend jev-score  --model typesafe/jev-1.13   --label jev_score
   python classify.py --backend openrouter --model qwen/qwen3.8-27b    --label qwen3.8_27b
+  python classify.py --backend openrouter --model typesafe/jev-router --label jev_router
   python classify.py --backend nimble     --model nimble              --label nimble
   python classify.py --merge   # build the comparison CSV from results/*.csv
 """
